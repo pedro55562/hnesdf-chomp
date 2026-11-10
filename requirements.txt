@@ -1,0 +1,4 @@
+torch
+numpy
+scipy
+uaibot==1.2.7
