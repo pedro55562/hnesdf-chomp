@@ -10,8 +10,15 @@ def h_esdf_box(T, lx, ly, lz, p, h):
     T and p must be floating tensors on the same device with the same dtype.
     For B poses and K points, pass T[:, None] and p[None].
     """
-    u = (T[..., :3, :3].transpose(-1, -2)
-         @ (p - T[..., :3, 3]).unsqueeze(-1)).squeeze(-1)
+    return _box_field(T, lx, ly, lz, p, h)[0]
+
+
+def _box_field(T, lx, ly, lz, p, h):
+    """Return h_esdf_box and its analytic spatial gradient d/dp."""
+    R = T[..., :3, :3]
+    # u = R^T (p - t), written elementwise: a matmul of millions of 3x3
+    # matrices is slow on GPUs and blocks kernel fusion.
+    u = ((p - T[..., :3, 3]).unsqueeze(-1) * R).sum(-2)
     a = p.new_tensor([lx, ly, lz]) / 2
     q = torch.logsumexp(torch.stack((u / h, -u / h), -1), -1) - a / h
     positive = torch.logsumexp(torch.stack((q, torch.zeros_like(q)), -1), -1)
@@ -20,7 +27,29 @@ def h_esdf_box(T, lx, ly, lz, p, h):
         torch.stack((-maximum, torch.zeros_like(maximum)), -1), -1)
     # Norm radius h**2 / ||a|| vanishes faster than the LSE bandwidth h.
     outside = torch.sqrt(positive.square().sum(-1) + (h / a.norm()).square())
-    return h * (outside - negative)
+    value = h * (outside - negative)
+    # Chain rule through the LSE/softplus terms; dq/du = tanh(u/h)/h.
+    grad_u = (positive * torch.sigmoid(q) / outside.unsqueeze(-1)
+              + torch.sigmoid(-maximum).unsqueeze(-1) * torch.softmax(q, -1)
+              ) * torch.tanh(u / h)
+    grad_p = (R * grad_u.unsqueeze(-2)).sum(-1)
+    return value, grad_p
+
+
+def _distance(T, cloud, lx, ly, lz, h):
+    """h-NESDF distance of each pose in T (B,4,4) to cloud (K,6)."""
+    D, grad_D = _box_field(T[:, None], lx, ly, lz, cloud[None, :, :3], h)
+    d = h_esdf_box(T, lx, ly, lz, T[:, :3, 3], h)
+    difference = D - d[:, None]
+    E = 0.5 * difference.square()  # Constant -d**2/2 cancels.
+    grad_E = difference.unsqueeze(-1) * grad_D
+    weights = torch.softmax(-E / h**2, dim=-1)
+    projection = (grad_E * cloud[None, :, 3:]).sum(-1)
+    return d - (weights * projection).sum(-1)
+
+
+# Fused GPU kernels; the pose gradient needs only a first-order backward.
+_distance_compiled = torch.compile(_distance)
 
 
 @torch.enable_grad()
@@ -40,7 +69,7 @@ def hNESDF(batch_T, lx, ly, lz, h, list_points, *,
     gradient_method: "autograd" or "finite_difference" for the pose gradient.
     fd_steps: (translation step in length units, rotation step in radians).
         Central differences evaluate perturbations sequentially. This avoids
-        second-order autograd; the spatial derivative still uses autograd.
+        second-order autograd; the spatial derivative is analytic.
     """
     if batch_T.ndim != 3 or batch_T.shape[1:] != (4, 4):
         raise ValueError("batch_T must have shape (B,4,4).")
@@ -78,22 +107,16 @@ def hNESDF(batch_T, lx, ly, lz, h, list_points, *,
     cloud = torch.as_tensor(list_points, dtype=T.dtype, device=T.device)
     if cloud.ndim != 2 or cloud.shape[1] != 6 or cloud.shape[0] == 0:
         raise ValueError("list_points must be a nonempty (K,6) oriented cloud.")
-    p = cloud[None, :, :3].expand(T.shape[0], -1, -1)
-    p = p.detach().clone().requires_grad_(True)
-
-    D = h_esdf_box(T[:, None], lx, ly, lz, p, h)
-    d = h_esdf_box(T, lx, ly, lz, T[:, :3, 3], h)
-    E = 0.5 * (D - d[:, None]).square()  # Constant -d**2/2 cancels.
-    grad_E = torch.autograd.grad(E.sum(), p, create_graph=compute_gradient)[0]
-    if not compute_gradient:
-        E = E.detach()  # No pose derivative is needed after the spatial derivative.
-    weights = torch.softmax(-E / h**2, dim=-1)
-    projection = (grad_E * cloud[None, :, 3:]).sum(-1)
-    distance = d - (weights * projection).sum(-1)
+    cloud = cloud.detach()
+    with torch.no_grad():
+        # Different compiled graphs round differently (~1e-6). Values always
+        # come from the same inference graph (same guards: no grad, detached T)
+        # so the optimizer's exact comparisons stay consistent.
+        distance = _distance_compiled(T.detach(), cloud, lx, ly, lz, h)
 
     L = None
     if compute_gradient:
-        G = torch.autograd.grad(distance.sum(), T)[0]
+        G = torch.autograd.grad(_distance_compiled(T, cloud, lx, ly, lz, h).sum(), T)[0]
         M = G[:, :3, :3] @ T[:, :3, :3].transpose(-1, -2)
         angular = torch.stack((M[:, 2, 1] - M[:, 1, 2],
                                M[:, 0, 2] - M[:, 2, 0],
