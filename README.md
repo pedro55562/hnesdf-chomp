@@ -1,7 +1,6 @@
 # hnesdf-chomp
 
 h-NESDF + CHOMP path optimization for a box in an underwater point-cloud scene.
-Script version of `h-nesdf_chomp_underwater.ipynb`.
 
 ## Setup
 
