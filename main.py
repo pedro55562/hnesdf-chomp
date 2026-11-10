@@ -56,7 +56,7 @@ def main():
                 proximity_gain=0,
                 proximity_epsilon=0.04,
                 momentum=0.95,
-                batch_size=30,  # Poses evaluated simultaneously; independent of N.
+                batch_size=None,  # Evaluate all N+1 poses in one call.
                 save_every=1,
                 check_substeps=10,
                 gradient_method="autograd",

@@ -17,6 +17,14 @@ python3 -m venv .venv
 
 The animation is saved to `output/result.html`; open it in a browser.
 
+The first call in each process compiles the GPU kernels (`torch.compile`), which takes about 10 s.
+
+Speed benchmark (seeded problems; it runs on any branch, so you can compare implementations):
+
+```bash
+.venv/bin/python bench_speed.py --problems 30
+```
+
 ## What is implemented
 
 | File | Contents |
@@ -28,7 +36,7 @@ The animation is saved to `output/result.html`; open it in a browser.
 
 ### How it works
 
-1. **Distance (`hNESDF`)**: for B poses and K cloud points, it evaluates `h_esdf_box` on a `(B, K)` grid. For each pose, a softmax over the K points (temperature `h²`) weights the points near the box. The distance is the SDF at the box center, corrected by the weighted projection of the spatial gradient onto the point normals. The pose differential comes from a second autograd pass (`create_graph=True`, i.e. second-order autograd), mapped to `[v, ω]` in the world frame.
+1. **Distance (`hNESDF`)**: for B poses and K cloud points, it evaluates `h_esdf_box` on a `(B, K)` grid. For each pose, a softmax over the K points (temperature `h²`) weights the points near the box. The distance is the SDF at the box center, corrected by the weighted projection of the spatial gradient onto the point normals. The spatial gradient of `h_esdf_box` is analytic (`_box_field`). The whole distance (`_distance`) is fused by `torch.compile`, so the pose differential needs only one first-order backward. It is mapped to `[v, ω]` in the world frame.
 2. **Objective (`path_objective`)**: `sum log(1 - s_k/threshold²)` keeps consecutive waypoints closer than `threshold`. `-G·τ·logsumexp(-d/τ)` rewards the minimum clearance. An optional term (`proximity_gain`) adds the CHOMP penalty, weighted by arc length. `main.py` uses `proximity_gain=0`.
 3. **Optimizer (`chomp_se3`)**:
    - Nesterov-style momentum on SE(3), using `matrix_exp` for rotations.
@@ -67,31 +75,39 @@ Everything runs in float32. With no CUDA available, `main.py` falls back to the 
   - The benchmark attempts in `main.py` run one after another. The loop stops at the first success.
   - The finite-difference gradient makes 12 extra evaluations, one by one.
 
-### Measured cost (RTX 4050 Laptop, float32, K = 54 570)
+### Measured cost (RTX 4050 Laptop, float32, K = 54 570, `bench_speed.py`, 30 seeded problems)
 
-| B (poses) | with gradient | distance only |
-|---|---|---|
-| 1 | 3.5 ms | 1.5 ms |
-| 30 | 81 ms | 30 ms |
-| 31 | 80 ms | 31 ms |
-| 128 | 353 ms | 139 ms |
+| | `main` (original) | `perf/fused-distance` | speed-up |
+|---|---|---|---|
+| `hNESDF`, 31 poses, with gradient | 80.6 ms | 12.4 ms | 6.5× |
+| `hNESDF`, 31 poses, distance only | 31.2 ms | 2.3 ms | 13.6× |
+| `chomp_se3`, per iteration | 215 ms | 31 ms | 6.9× |
+| `chomp_se3`, mean per problem | 3.09 s | 0.45 s | 6.9× |
 
-- **Scaling**: the time grows about linearly with B, so the GPU is already saturated at B ≈ 30. Larger batches will not make things faster; reducing K will.
-- **Memory**: B = 128 with gradient peaks at about 3 GB of VRAM.
-- **Finite differences** with B = 1: 24 ms (vs 3.5 ms with autograd).
-- **Typical run**: one attempt takes 0.5–6 s. The first attempt also pays for CUDA warm-up, and `perf_counter` does not separate it.
+Both versions give the same status, iteration count and clearance on all 30 problems. The distances match to about 1e-7 and the gradients to about 1e-5 (relative).
+
+What changed in `perf/fused-distance`:
+- **Rotation.** The point rotation `R^T (p - t)` used to be millions of tiny 3×3 matmuls, which are slow on GPUs and block kernel fusion. It is now written elementwise.
+- **Analytic gradient.** The spatial gradient of `h_esdf_box` is analytic, so the code no longer needs second-order autograd, which `torch.compile` does not support.
+- **Kernel fusion.** `torch.compile` fuses the whole distance into a few kernels. The distance values always come from the same compiled inference graph. Different graphs round differently (about 1e-6), and that would break the optimizer's exact `fy < f` comparisons.
+- **Chunking.** `main.py` now uses `batch_size=None`, which avoids a 30 + 1 pose split.
+
+Original profile (`main`), for reference:
+- **Memory bound.** The code reached the memory-bandwidth limit (about 150 GB/s on this GPU), with 448 kernels per call. The tiny matmuls alone took about 36 of the 82 ms.
+- **Scaling.** The time grew about linearly with B, so the GPU was saturated at B ≈ 30.
+- **Memory use.** B = 128 with gradient peaked at about 3 GB of VRAM.
+- **Finite differences.** The finite-difference gradient took 24 ms for one pose (vs 3.5 ms with autograd).
 
 ## Potential improvements
 
 ### Performance
 
 - **Prune the point cloud.** The softmax weights with temperature `h²` make far points irrelevant. Keep only the points within some margin of the path's bounding box, or use a KD-tree / voxel grid around each pose. The cost scales with K, so this is the biggest gain available.
-- **Fix the chunking.** `batch_size=30` with `N+1 = 31` poses creates a 30-pose chunk plus a 1-pose chunk. Use `batch_size=None` or `N+1`.
 - **Skip the fixed endpoints.** Their distance and gradient are computed every evaluation and then thrown away.
 - **Batch the line search.** Evaluate several step sizes α in one batched call instead of halving one by one.
 - **Batch the problems.** Run several start/goal pairs at once (benchmarking, multi-start).
 - **Reduce GPU syncs.** Avoid the `float(...)` calls inside `path_objective` on every evaluation.
-- **Fuse kernels.** `torch.compile` or CUDA graphs can cut launch overhead for the many small kernels.
+- **CUDA graphs.** The distance is fused now (`torch.compile`). CUDA graphs could also cut the per-iteration launch overhead.
 - **Densify on the GPU.** Run `_interpolate` in torch to avoid the CPU round trip in the dense check.
 - **Time it correctly.** Do a warm-up before timing, and call `torch.cuda.synchronize()` around the measurement.
 
