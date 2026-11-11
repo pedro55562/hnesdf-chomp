@@ -114,38 +114,154 @@ def chomp_se3(H_start, H_goal, lx, ly, lz, h, list_points, N=40, *,
               stop_when_clear=True, gradient_method="autograd",
               fd_steps=(1e-3, 1e-3), proximity_gain=10.0,
               proximity_epsilon=None, echo = True):
-    """Return (paths, info); paths[-1] is the final waypoint sequence.
+    """Plan a collision-avoiding SE(3) path for a box with a CHOMP-like optimizer.
 
-    N is the number of segments: there are N+1 poses and N-1 free poses.
-    Each saved path is a NumPy array (N+1,4,4), including fixed endpoints.
-    Default initialization is linear translation plus shortest-arc SLERP.
-    initial_path, when given, must have that same shape and endpoint poses.
+    The box (full side lengths lx, ly, lz) must go from H_start to H_goal
+    through an environment given as an oriented point cloud. The path is
+    discretized into N segments, i.e. N+1 poses H[0..N]. The endpoints
+    H[0]=H_start and H[N]=H_goal are fixed; the N-1 inner poses are
+    optimized by gradient ascent with Nesterov-style momentum on SE(3).
+    Clearance is measured with the h-NESDF between the box and the cloud
+    (see hnesdf.hNESDF). This is a LOCAL optimizer: it can fail from a
+    poor initial path.
 
-    The maximized objective is sum(log(1-s_k/threshold**2))
-    -G*tau*logsumexp(-d_k/tau) - proximity_gain*C, with tau=softmin_h or h and
-    s_k=||t[k+1]-t[k]||^2+rotation_scale^2*||R[k+1]-R[k]||_F^2.
-    C=sum_k sqrt(s_k)*(rho(d_k)+rho(d_{k+1}))/2, where rho(d) is CHOMP's
-    penalty: -d+epsilon/2 for d<0, (d-epsilon)**2/(2*epsilon) for
-    0<=d<=epsilon, and zero otherwise. epsilon=proximity_epsilon defaults
-    to clearance when positive, or h otherwise. This is a pose-arc-length
-    adaptation, using the whole-box h-NESDF in place of CHOMP's body-point
-    workspace integral. Its gradient includes the arc-length derivative.
-    Set proximity_gain=0 to recover the previous objective, or G=0 to use
-    only the CHOMP proximity penalty plus the original spacing barrier.
-    rotation_scale is a length scale; 1 reproduces the numerical matrix norm.
-    Backtracking maintains the strict spacing bound and monotone objective.
-    Optional temporal-Laplacian preconditioning spreads updates along the path.
+    Objective (maximized; paper eqs. 31-33)
+    ---------------------------------------
+        f = sum_k log(1 - s_k / threshold**2)            spacing barrier
+            - G * tau * logsumexp_k(-d_k / tau)          soft-min clearance
+            - proximity_gain * C                         optional CHOMP term
 
-    info['success'] means a DENSE SAMPLED h-NESDF margin check passed.
-    It is NOT an exact or continuous swept-volume collision certificate.
-    info['dense_path'] uses the same linear/SLERP interpolation as initialization.
-    This is a local optimizer and can fail from a poor initial path.
-    stop_when_clear=False continues optimizing after waypoint clearance
-    is reached, up to iterations or a line-search stall.
-    gradient_method="finite_difference" uses central differences only for
-    the h-NESDF pose gradient; the spacing gradient remains exact.
-    fd_steps=(translation step, rotation step in radians). Keep float32 or
-    float64 computation; tune the steps to the scene scale and bandwidth.
+    - s_k = ||t[k+1]-t[k]||^2 + rotation_scale**2 * ||R[k+1]-R[k]||_F^2 is the
+      squared pose distance between consecutive poses. If any sqrt(s_k)
+      reaches threshold, the path is infeasible and f = -inf, so every
+      accepted step keeps all consecutive poses closer than threshold.
+    - d_k is the h-NESDF of pose k; tau = softmin_h (or h if None). The
+      logsumexp term is a smooth approximation of the minimum clearance.
+    - C = sum_k sqrt(s_k) * (rho(d_k) + rho(d_{k+1})) / 2 is CHOMP's proximity
+      penalty integrated along the pose arc length (trapezoidal rule), with
+      rho(d) = -d + eps/2 for d < 0, (eps - d)**2 / (2*eps) for 0 <= d <= eps,
+      and 0 otherwise; eps = proximity_epsilon. Use proximity_gain=0 to drop
+      it (as in the paper), or G=0 to use only this penalty plus the barrier.
+
+    Mapping to the paper's Table IV: N = T, G = C_weight,
+    threshold = C_threshold, rotation_scale**2 = C_factor, momentum = beta,
+    step_size = Delta t.
+
+    Algorithm
+    ---------
+    1. Initialization: initial_path, or linear translation plus
+       shortest-arc SLERP between the endpoints. Raises ValueError if the
+       initial path already violates the spacing bound, or if an endpoint
+       has h-NESDF below clearance.
+    2. Each iteration (up to `iterations`):
+       a. If stop_when_clear and every pose has d_k >= clearance, stop.
+       b. Look-ahead: Y = H moved by momentum * velocity. Evaluate f and its
+          world-frame gradient [v, w] (6 per pose) at Y; endpoint rows are 0.
+       c. Direction: the gradient, optionally preconditioned with a temporal
+          Laplacian (precondition=True), which spreads each update smoothly
+          along the path. Rotation rows are divided by rotation_scale**2, and
+          the direction is scaled so that no pose moves more than 1 per unit step.
+       d. Backtracking line search from H with increments
+          momentum * velocity + alpha * direction. alpha starts at the last
+          accepted step (at most step_size) and is halved up to 24 times
+          until Armijo holds: f(trial) >= f(Y) + 1e-4 * alpha * slope.
+       e. If the momentum attempt fails, retry once with zero momentum. If
+          that also fails, stop with status "stalled".
+       Poses are updated with the exponential map (rotation R <- exp([w]) R,
+       translation t <- t + v), so they always stay valid SE(3) poses.
+    3. Final check: the final path is densified with `check_substeps`
+       substeps per segment (same linear/SLERP interpolation), and the
+       h-NESDF is evaluated on every dense pose.
+
+    Parameters
+    ----------
+    H_start, H_goal : (4,4) array-like
+        Fixed start and goal poses (homogeneous transforms, world frame).
+    lx, ly, lz : float
+        Full side lengths of the box.
+    h : float
+        h-NESDF smoothing parameter (bandwidth).
+    list_points : (K,6) tensor
+        Environment cloud [px, py, pz, nx, ny, nz] (points + outward unit
+        normals, world frame). Its device and dtype set where everything runs.
+    N : int
+        Number of segments (N+1 poses, N-1 free poses). N >= 2.
+    threshold : float
+        Maximum pose distance between consecutive poses (spacing barrier).
+    G : float
+        Weight of the soft-min clearance reward.
+    iterations : int
+        Maximum number of optimizer iterations.
+    step_size : float
+        Maximum line-search step alpha.
+    momentum : float in [0, 1)
+        Nesterov momentum coefficient.
+    clearance : float
+        Required h-NESDF margin, for early stopping and for success.
+    softmin_h : float or None
+        Temperature tau of the soft-min; None uses h.
+    rotation_scale : float
+        Length scale that weights rotation against translation in s_k.
+    batch_size : int or None
+        Poses per hNESDF call; None evaluates all poses at once.
+    save_every : int
+        Store the path every `save_every` iterations (for animation).
+    check_substeps : int
+        Interpolation substeps per segment in the final dense check.
+    initial_path : (N+1,4,4) array or tensor, optional
+        Custom initial path; its endpoints are replaced by H_start/H_goal.
+    precondition : bool
+        Use temporal-Laplacian preconditioning.
+    stop_when_clear : bool
+        Stop as soon as every pose reaches clearance. If False, keep
+        optimizing until `iterations` or a stall.
+    gradient_method : {"autograd", "finite_difference"}
+        How the h-NESDF pose gradient is computed. Finite differences use
+        central differences with fd_steps = (translation step, rotation step
+        in radians); the spacing-barrier gradient is always exact.
+    proximity_gain : float
+        Weight of the CHOMP proximity penalty (0 disables it).
+    proximity_epsilon : float or None
+        eps of rho(d); None uses clearance if positive, else h.
+    echo : bool
+        Print the iteration number and minimum distance at each iteration.
+
+    Returns
+    -------
+    paths : list of (N+1,4,4) NumPy arrays
+        Saved paths, including the endpoints. paths[0] is the initial path
+        and paths[-1] the final one (always saved).
+    info : dict
+        success : bool
+            True if every dense pose has finite h-NESDF >= clearance.
+            This is a SAMPLED check with the smoothed distance itself: it is
+            NOT an exact or continuous (swept-volume) collision certificate.
+        status : str
+            "dense_sampled_clearance_reached" (success),
+            "dense_check_failed" (all N+1 poses clear, a dense pose is not),
+            "max_iterations" or "stalled" (stopped before clearing).
+        iterations : int
+            Completed iterations.
+        saved_iterations : list of int
+            Iteration index of each entry of `paths`.
+        objective_history, min_distance_history, max_step_history : lists
+            f, min_k d_k and max_k sqrt(s_k) after each accepted iteration.
+        final_distances : (N+1,) array
+            h-NESDF of each pose of the final path.
+        dense_path : (N*check_substeps+1,4,4) array
+            Densified final path used by the success check.
+        dense_distances : array
+            h-NESDF of each dense pose.
+        min_dense_distance : float
+            Minimum of dense_distances.
+        clearance, threshold, proximity_gain, proximity_epsilon
+            Values used in this run.
+
+    Raises
+    ------
+    ValueError
+        Invalid parameters, an initial path that violates the spacing bound,
+        an endpoint below clearance, or an initial_path of the wrong shape.
     """
     tau = h if softmin_h is None else softmin_h
     eps = (clearance if clearance > 0 else h) if proximity_epsilon is None else proximity_epsilon
