@@ -15,7 +15,7 @@ python3 -m venv .venv
 .venv/bin/python main.py
 ```
 
-The animation is saved to `output/result.html`; open it in a browser.
+It runs `N_SCENARIOS` random scenarios (set at the top of `main.py`). Each animation is saved as `output/success/scenario_XXX.html` or `output/failure/scenario_XXX.html`; open it in a browser. Each file is about 3 MB.
 
 The first call in each process compiles the GPU kernels (`torch.compile`), which takes about 10 s.
 
